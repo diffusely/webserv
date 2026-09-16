@@ -1,0 +1,5 @@
+webserv
+*.o
+a.out
+ROADMAP.md
+SUBJECT_NOTES.md
