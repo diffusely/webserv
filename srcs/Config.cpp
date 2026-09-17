@@ -1,6 +1,7 @@
 #include "Config.hpp"
 
-Config::Config() : _port(8080)
+Config::Config()
+	: _port(8080)
 {
 }
 

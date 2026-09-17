@@ -3,6 +3,7 @@
 #include <string>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include "HttpRequest.hpp"
 
 class Client
 {
@@ -19,8 +20,13 @@ public:
 	bool hasDataToWrite() const;
 	ssize_t flushWriteBuffer();
 
+	void parseRequest();
+	bool requestIsComplete() const;
+	const HttpRequest &getRequest() const;
+
 private:
 	int _fd;
 	std::string _readBuffer;
 	std::string _writeBuffer;
+	HttpRequest _request;
 };

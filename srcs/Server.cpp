@@ -1,4 +1,5 @@
 #include "Server.hpp"
+#include "HttpRequest.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -7,7 +8,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-Server::Server(int port) : _port(port), _server_fd(-1)
+Server::Server(int port)
+	: _port(port), _server_fd(-1)
 {
 	setupSocket();
 }
@@ -89,62 +91,97 @@ void Server::run()
 
 	while (true) {
 		int ready = poll(&_pollfds[0], _pollfds.size(), -1);
-		if (ready < 0) {
+		if (ready < 0)
 			throw std::runtime_error("poll() failed");
-		}
 
 		for (size_t i = 0; i < _pollfds.size(); ) {
-			short revents = _pollfds[i].revents;
-
-			if (revents == 0) {
+			if (_pollfds[i].revents == 0) {
 				i++;
 				continue;
 			}
 
 			if (_pollfds[i].fd == _server_fd) {
-				if (revents & POLLIN)
-					acceptNewClient();
+				handleServerEvent(_pollfds[i].revents);
 				i++;
 				continue;
 			}
 
-			int fd = _pollfds[i].fd;
-			std::map<int, Client>::iterator it = _clients.find(fd);
-			bool shouldClose = false;
-
-			if (revents & POLLIN) {
-				char buffer[1024];
-				ssize_t bytesRead = recv(fd, buffer, sizeof(buffer) - 1, 0);
-
-				if (bytesRead <= 0) {
-					shouldClose = true;
-				} else {
-					buffer[bytesRead] = '\0';
-					std::cout << "Received from fd=" << fd << ": " << buffer << std::endl;
-					it->second.appendToReadBuffer(buffer, bytesRead);
-					it->second.appendToWriteBuffer(it->second.getReadBuffer());
-					it->second.clearReadBuffer();
-				}
-			}
-
-			if (!shouldClose && (revents & POLLOUT) && it->second.hasDataToWrite()) {
-				ssize_t sent = it->second.flushWriteBuffer();
-				if (sent < 0)
-					shouldClose = true;
-			}
-
-			if (shouldClose) {
-				std::cout << "Client disconnected! fd=" << fd << std::endl;
-				close(fd);
-				_clients.erase(it);
-				_pollfds.erase(_pollfds.begin() + i);
-			} else {
-				if (it->second.hasDataToWrite())
-					_pollfds[i].events |= POLLOUT;
-				else
-					_pollfds[i].events &= ~POLLOUT;
+			if (handleClientEvent(i))
 				i++;
-			}
 		}
 	}
+}
+
+void Server::handleServerEvent(short revents)
+{
+	if (revents & POLLIN)
+		acceptNewClient();
+}
+
+bool Server::handleClientEvent(size_t i)
+{
+	short revents = _pollfds[i].revents;
+	int fd = _pollfds[i].fd;
+	std::map<int, Client>::iterator it = _clients.find(fd);
+	bool shouldClose = false;
+
+	if (revents & POLLIN)
+		shouldClose = !readFromClient(it);
+
+	if (!shouldClose && (revents & POLLOUT) && it->second.hasDataToWrite())
+		shouldClose = !writeToClient(it);
+
+	if (shouldClose) {
+		closeClient(i, it);
+		return false;
+	}
+
+	if (it->second.hasDataToWrite())
+		_pollfds[i].events |= POLLOUT;
+	else
+		_pollfds[i].events &= ~POLLOUT;
+	return true;
+}
+
+bool Server::readFromClient(std::map<int, Client>::iterator it)
+{
+	char buffer[1024];
+	ssize_t bytesRead = recv(it->first, buffer, sizeof(buffer) - 1, 0);
+
+	if (bytesRead <= 0)
+		return false;
+
+	it->second.appendToReadBuffer(buffer, bytesRead);
+	it->second.parseRequest();
+
+	if (it->second.requestIsComplete())
+		printRequest(it->second.getRequest());
+
+	return true;
+}
+
+bool Server::writeToClient(std::map<int, Client>::iterator it)
+{
+	ssize_t sent = it->second.flushWriteBuffer();
+
+	return sent >= 0;
+}
+
+void Server::printRequest(const HttpRequest &req) const
+{
+	std::cout << "Method: " << req.getMethod()
+		<< " Path: " << req.getPath()
+		<< " Version: " << req.getVersion() << std::endl;
+
+	const std::map<std::string, std::string> &headers = req.getHeaders();
+	for (std::map<std::string, std::string>::const_iterator hit = headers.begin(); hit != headers.end(); ++hit)
+		std::cout << "  " << hit->first << ": " << hit->second << std::endl;
+}
+
+void Server::closeClient(size_t i, std::map<int, Client>::iterator it)
+{
+	std::cout << "Client disconnected! fd=" << it->first << std::endl;
+	close(it->first);
+	_clients.erase(it);
+	_pollfds.erase(_pollfds.begin() + i);
 }

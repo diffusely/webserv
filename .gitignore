@@ -3,3 +3,8 @@ webserv
 a.out
 ROADMAP.md
 SUBJECT_NOTES.md
+
+core
+vgcore.*
+*.swp
+.vscode/

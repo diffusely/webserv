@@ -26,6 +26,21 @@ void Client::clearReadBuffer()
 	_readBuffer.clear();
 }
 
+void Client::parseRequest()
+{
+	_request.parse(_readBuffer);
+}
+
+bool Client::requestIsComplete() const
+{
+	return _request.isComplete();
+}
+
+const HttpRequest &Client::getRequest() const
+{
+	return _request;
+}
+
 void Client::appendToWriteBuffer(const std::string &data)
 {
 	_writeBuffer += data;
