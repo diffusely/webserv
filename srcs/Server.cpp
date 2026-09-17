@@ -14,20 +14,18 @@ Server::Server(int port) : _port(port), _server_fd(-1)
 
 Server::~Server()
 {
-	for (std::map<int, Client>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+	for (std::map<int, Client>::iterator it = _clients.begin(); it != _clients.end(); ++it)
 		close(it->first);
-	}
-	if (_server_fd >= 0) {
+
+	if (_server_fd >= 0)
 		close(_server_fd);
-	}
 }
 
 void Server::setupSocket()
 {
 	_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (_server_fd < 0) {
+	if (_server_fd < 0)
 		throw std::runtime_error("socket() failed");
-	}
 
 	int opt = 1;
 	if (setsockopt(_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
@@ -66,9 +64,8 @@ void Server::setupSocket()
 void Server::acceptNewClient()
 {
 	int fd = accept(_server_fd, NULL, NULL);
-	if (fd < 0) {
+	if (fd < 0)
 		return;
-	}
 
 	if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
 		close(fd);
@@ -97,30 +94,55 @@ void Server::run()
 		}
 
 		for (size_t i = 0; i < _pollfds.size(); ) {
-			if (!(_pollfds[i].revents & POLLIN)) {
+			short revents = _pollfds[i].revents;
+
+			if (revents == 0) {
 				i++;
 				continue;
 			}
 
 			if (_pollfds[i].fd == _server_fd) {
-				acceptNewClient();
+				if (revents & POLLIN)
+					acceptNewClient();
 				i++;
 				continue;
 			}
 
 			int fd = _pollfds[i].fd;
-			char buffer[1024];
-			ssize_t bytesRead = recv(fd, buffer, sizeof(buffer) - 1, 0);
+			std::map<int, Client>::iterator it = _clients.find(fd);
+			bool shouldClose = false;
 
-			if (bytesRead <= 0) {
+			if (revents & POLLIN) {
+				char buffer[1024];
+				ssize_t bytesRead = recv(fd, buffer, sizeof(buffer) - 1, 0);
+
+				if (bytesRead <= 0) {
+					shouldClose = true;
+				} else {
+					buffer[bytesRead] = '\0';
+					std::cout << "Received from fd=" << fd << ": " << buffer << std::endl;
+					it->second.appendToReadBuffer(buffer, bytesRead);
+					it->second.appendToWriteBuffer(it->second.getReadBuffer());
+					it->second.clearReadBuffer();
+				}
+			}
+
+			if (!shouldClose && (revents & POLLOUT) && it->second.hasDataToWrite()) {
+				ssize_t sent = it->second.flushWriteBuffer();
+				if (sent < 0)
+					shouldClose = true;
+			}
+
+			if (shouldClose) {
 				std::cout << "Client disconnected! fd=" << fd << std::endl;
 				close(fd);
-				_clients.erase(fd);
+				_clients.erase(it);
 				_pollfds.erase(_pollfds.begin() + i);
 			} else {
-				buffer[bytesRead] = '\0';
-				std::cout << "Received from fd=" << fd << ": " << buffer << std::endl;
-				send(fd, buffer, bytesRead, 0);
+				if (it->second.hasDataToWrite())
+					_pollfds[i].events |= POLLOUT;
+				else
+					_pollfds[i].events &= ~POLLOUT;
 				i++;
 			}
 		}
