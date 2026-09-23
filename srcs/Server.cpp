@@ -1,5 +1,6 @@
 #include "Server.hpp"
 #include "HttpRequest.hpp"
+#include "HttpResponse.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -154,8 +155,12 @@ bool Server::readFromClient(std::map<int, Client>::iterator it)
 	it->second.appendToReadBuffer(buffer, bytesRead);
 	it->second.parseRequest();
 
-	if (it->second.requestIsComplete())
+	while (it->second.requestIsComplete()) {
 		printRequest(it->second.getRequest());
+		queueResponse(it->second);
+		it->second.resetRequest();
+		it->second.parseRequest();
+	}
 
 	return true;
 }
@@ -176,6 +181,15 @@ void Server::printRequest(const HttpRequest &req) const
 	const std::map<std::string, std::string> &headers = req.getHeaders();
 	for (std::map<std::string, std::string>::const_iterator hit = headers.begin(); hit != headers.end(); ++hit)
 		std::cout << "  " << hit->first << ": " << hit->second << std::endl;
+}
+
+void Server::queueResponse(Client &client)
+{
+	HttpResponse response;
+
+	response.setHeader("Content-Type", "text/html");
+	response.setBody("<h1>Hello from webserv</h1>");
+	client.appendToWriteBuffer(response.toString());
 }
 
 void Server::closeClient(size_t i, std::map<int, Client>::iterator it)

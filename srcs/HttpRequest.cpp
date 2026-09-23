@@ -56,6 +56,16 @@ bool HttpRequest::isComplete() const
 	return _state == DONE;
 }
 
+void HttpRequest::reset()
+{
+	_state = PARSING_REQUEST_LINE;
+	_method.clear();
+	_path.clear();
+	_version.clear();
+	_headers.clear();
+	_body.clear();
+}
+
 const std::string &HttpRequest::getMethod() const
 {
 	return _method;

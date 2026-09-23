@@ -17,6 +17,7 @@ public:
 
 	void parse(std::string &buffer);
 	bool isComplete() const;
+	void reset();
 
 	const std::string &getMethod() const;
 	const std::string &getPath() const;

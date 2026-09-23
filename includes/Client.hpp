@@ -23,6 +23,7 @@ public:
 	void parseRequest();
 	bool requestIsComplete() const;
 	const HttpRequest &getRequest() const;
+	void resetRequest();
 
 private:
 	int _fd;

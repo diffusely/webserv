@@ -12,6 +12,11 @@ void HttpResponse::setStatus(int code, const std::string &reason)
 	_statusReason = reason;
 }
 
+void HttpResponse::setHeader(const std::string &key, const std::string &value)
+{
+	_headers[key] = value;
+}
+
 void HttpResponse::setBody(const std::string &body)
 {
 	_body = body;
@@ -22,6 +27,8 @@ std::string HttpResponse::toString() const
 	std::ostringstream response;
 
 	response << "HTTP/1.1 " << _statusCode << " " << _statusReason << "\r\n";
+	for (std::map<std::string, std::string>::const_iterator it = _headers.begin(); it != _headers.end(); ++it)
+		response << it->first << ": " << it->second << "\r\n";
 	response << "Content-Length: " << _body.size() << "\r\n";
 	response << "\r\n";
 	response << _body;

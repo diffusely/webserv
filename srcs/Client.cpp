@@ -41,6 +41,11 @@ const HttpRequest &Client::getRequest() const
 	return _request;
 }
 
+void Client::resetRequest()
+{
+	_request.reset();
+}
+
 void Client::appendToWriteBuffer(const std::string &data)
 {
 	_writeBuffer += data;
