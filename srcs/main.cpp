@@ -2,6 +2,7 @@
 #include "Config.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <csignal>
 
 int main(int argc, char **argv)
 {
@@ -10,10 +11,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	// a client that disconnects while we send() would otherwise kill the whole server
+	signal(SIGPIPE, SIG_IGN);
+
 	try
 	{
 		Config config(argc == 2 ? argv[1] : "config/default.conf");
-		Server server(config);
+		Server server(config.getServers());
 
 		server.run();
 	}

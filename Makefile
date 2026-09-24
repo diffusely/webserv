@@ -6,6 +6,8 @@ CXXFLAGS = -Wall -Wextra -Werror -std=c++98 -Iincludes
 SRCS = srcs/main.cpp \
        srcs/Server.cpp \
        srcs/Config.cpp \
+       srcs/ServerConfig.cpp \
+       srcs/RequestHandler.cpp \
        srcs/Client.cpp \
        srcs/HttpRequest.cpp \
        srcs/HttpResponse.cpp

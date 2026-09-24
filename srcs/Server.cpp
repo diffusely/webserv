@@ -1,76 +1,112 @@
 #include "Server.hpp"
 #include "HttpRequest.hpp"
-#include "HttpResponse.hpp"
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <cstring>
-#include <cctype>
+#include <ctime>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/stat.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-Server::Server(const Config &config)
-	: _port(config.getPort()), _server_fd(-1), _root(config.getRoot()), _index(config.getIndex())
+Server::Server(const std::vector<ServerConfig> &configs)
+	: _configs(configs)
 {
-	setupSocket();
+	for (size_t i = 0; i < _configs.size(); i++)
+		_handlers.push_back(RequestHandler(_configs[i]));
+
+	try {
+		setupSockets();
+	} catch (...) {
+		closeAll();
+		throw;
+	}
 }
 
 Server::~Server()
 {
-	for (std::map<int, Client>::iterator it = _clients.begin(); it != _clients.end(); ++it)
-		close(it->first);
-
-	if (_server_fd >= 0)
-		close(_server_fd);
+	closeAll();
 }
 
-void Server::setupSocket()
+void Server::closeAll()
 {
-	_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (_server_fd < 0)
+	for (size_t i = 0; i < _pollfds.size(); i++)
+		close(_pollfds[i].fd);
+	_pollfds.clear();
+	_clients.clear();
+	_listeners.clear();
+}
+
+// several server blocks may share one host:port - they share one socket,
+// and the Host header picks which of them answers
+void Server::setupSockets()
+{
+	std::map<std::string, int> opened;
+
+	for (size_t i = 0; i < _configs.size(); i++) {
+		for (size_t j = 0; j < _configs[i].listens.size(); j++) {
+			const Listen &listen = _configs[i].listens[j];
+			std::map<std::string, int>::iterator it = opened.find(listen.key());
+
+			int fd;
+			if (it != opened.end()) {
+				fd = it->second;
+			} else {
+				fd = openListenSocket(listen);
+				opened[listen.key()] = fd;
+				std::cout << "Listening on " << listen.key() << std::endl;
+			}
+			_listeners[fd].push_back(i);
+		}
+	}
+}
+
+int Server::openListenSocket(const Listen &listen)
+{
+	struct addrinfo hints;
+	struct addrinfo *result;
+	std::ostringstream port;
+
+	std::memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	port << listen.port;
+
+	int status = getaddrinfo(listen.host.c_str(), port.str().c_str(), &hints, &result);
+	if (status != 0)
+		throw std::runtime_error("cannot resolve " + listen.key() + ": " + gai_strerror(status));
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		freeaddrinfo(result);
 		throw std::runtime_error("socket() failed");
+	}
 
 	int opt = 1;
-	if (setsockopt(_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-		close(_server_fd);
-		throw std::runtime_error("setsockopt() failed");
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0
+		|| fcntl(fd, F_SETFL, O_NONBLOCK) < 0
+		|| bind(fd, result->ai_addr, result->ai_addrlen) < 0
+		|| ::listen(fd, SOMAXCONN) < 0) {
+		freeaddrinfo(result);
+		close(fd);
+		throw std::runtime_error("cannot listen on " + listen.key());
 	}
+	freeaddrinfo(result);
 
-	if (fcntl(_server_fd, F_SETFL, O_NONBLOCK) < 0) {
-		close(_server_fd);
-		throw std::runtime_error("fcntl() failed");
-	}
-
-	sockaddr_in address;
-	std::memset(&address, 0, sizeof(address));
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons(_port);
-
-	if (bind(_server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-		close(_server_fd);
-		throw std::runtime_error("bind() failed");
-	}
-
-	if (listen(_server_fd, 10) < 0) {
-		close(_server_fd);
-		throw std::runtime_error("listen() failed");
-	}
-
-	struct pollfd serverEntry;
-	serverEntry.fd = _server_fd;
-	serverEntry.events = POLLIN;
-	serverEntry.revents = 0;
-	_pollfds.push_back(serverEntry);
+	struct pollfd entry;
+	entry.fd = fd;
+	entry.events = POLLIN;
+	entry.revents = 0;
+	_pollfds.push_back(entry);
+	return fd;
 }
 
-void Server::acceptNewClient()
+void Server::acceptNewClient(int listenFd)
 {
-	int fd = accept(_server_fd, NULL, NULL);
+	int fd = accept(listenFd, NULL, NULL);
 	if (fd < 0)
 		return;
 
@@ -79,23 +115,20 @@ void Server::acceptNewClient()
 		return;
 	}
 
-	struct pollfd newEntry;
-	newEntry.fd = fd;
-	newEntry.events = POLLIN;
-	newEntry.revents = 0;
-	_pollfds.push_back(newEntry);
+	struct pollfd entry;
+	entry.fd = fd;
+	entry.events = POLLIN;
+	entry.revents = 0;
+	_pollfds.push_back(entry);
 
-	_clients.insert(std::make_pair(fd, Client(fd)));
-
-	std::cout << "Client connected! fd=" << fd << std::endl;
+	_clients.insert(std::make_pair(fd, Client(fd, listenFd)));
 }
 
 void Server::run()
 {
-	std::cout << "Listening on port " << _port << "..." << std::endl;
-
 	while (true) {
-		int ready = poll(&_pollfds[0], _pollfds.size(), -1);
+		// wake up at least once a second so timeouts get checked even when nobody talks
+		int ready = poll(&_pollfds[0], _pollfds.size(), 1000);
 		if (ready < 0)
 			throw std::runtime_error("poll() failed");
 
@@ -105,8 +138,9 @@ void Server::run()
 				continue;
 			}
 
-			if (_pollfds[i].fd == _server_fd) {
-				handleServerEvent(_pollfds[i].revents);
+			if (_listeners.count(_pollfds[i].fd)) {
+				if (_pollfds[i].revents & POLLIN)
+					acceptNewClient(_pollfds[i].fd);
 				i++;
 				continue;
 			}
@@ -114,205 +148,157 @@ void Server::run()
 			if (handleClientEvent(i))
 				i++;
 		}
+
+		checkTimeouts();
 	}
 }
 
-void Server::handleServerEvent(short revents)
-{
-	if (revents & POLLIN)
-		acceptNewClient();
-}
-
+// returns false if the client was closed (and removed from _pollfds)
 bool Server::handleClientEvent(size_t i)
 {
 	short revents = _pollfds[i].revents;
-	int fd = _pollfds[i].fd;
-	std::map<int, Client>::iterator it = _clients.find(fd);
+	Client &client = _clients.find(_pollfds[i].fd)->second;
 	bool shouldClose = false;
 
 	if (revents & POLLIN)
-		shouldClose = !readFromClient(it);
+		shouldClose = !readFromClient(client);
+	else if (revents & (POLLHUP | POLLERR | POLLNVAL))
+		shouldClose = true;
 
-	if (!shouldClose && (revents & POLLOUT) && it->second.hasDataToWrite())
-		shouldClose = !writeToClient(it);
+	if (!shouldClose && (revents & POLLOUT) && client.hasDataToWrite()) {
+		if (client.flushWriteBuffer() < 0)
+			shouldClose = true;
+		else
+			client.touch();
+	}
+
+	if (client.shouldClose() && !client.hasDataToWrite())
+		shouldClose = true;
 
 	if (shouldClose) {
-		closeClient(i, it);
+		closeClient(i);
 		return false;
 	}
 
-	if (it->second.hasDataToWrite())
+	if (client.hasDataToWrite())
 		_pollfds[i].events |= POLLOUT;
 	else
 		_pollfds[i].events &= ~POLLOUT;
 	return true;
 }
 
-bool Server::readFromClient(std::map<int, Client>::iterator it)
+bool Server::readFromClient(Client &client)
 {
-	char buffer[1024];
-	ssize_t bytesRead = recv(it->first, buffer, sizeof(buffer) - 1, 0);
+	char buffer[8192];
+	ssize_t bytesRead = recv(client.getFd(), buffer, sizeof(buffer), 0);
 
 	if (bytesRead <= 0)
 		return false;
+	client.touch();
 
-	it->second.appendToReadBuffer(buffer, bytesRead);
-	it->second.parseRequest();
-
-	while (it->second.requestIsComplete()) {
-		printRequest(it->second.getRequest());
-		queueResponse(it->second);
-		it->second.resetRequest();
-		it->second.parseRequest();
-	}
-
-	return true;
-}
-
-bool Server::writeToClient(std::map<int, Client>::iterator it)
-{
-	ssize_t sent = it->second.flushWriteBuffer();
-
-	return sent >= 0;
-}
-
-void Server::printRequest(const HttpRequest &req) const
-{
-	std::cout << "Method: " << req.getMethod()
-		<< " Path: " << req.getPath()
-		<< " Version: " << req.getVersion() << std::endl;
-
-	const std::map<std::string, std::string> &headers = req.getHeaders();
-	for (std::map<std::string, std::string>::const_iterator hit = headers.begin(); hit != headers.end(); ++hit)
-		std::cout << "  " << hit->first << ": " << hit->second << std::endl;
-}
-
-static bool readFile(const std::string &path, std::string &content)
-{
-	std::ifstream file(path.c_str(), std::ios::in | std::ios::binary);
-	if (!file.is_open())
-		return false;
-
-	std::ostringstream buffer;
-	buffer << file.rdbuf();
-	content = buffer.str();
-	return true;
-}
-
-static HttpResponse errorResponse(int code, const std::string &reason)
-{
-	HttpResponse response;
-	std::ostringstream body;
-
-	body << "<h1>" << code << " " << reason << "</h1>";
-	response.setStatus(code, reason);
-	response.setHeader("Content-Type", "text/html");
-	response.setBody(body.str());
-	return response;
-}
-
-static std::string getContentType(const std::string &path)
-{
-	size_t dot = path.rfind('.');
-	size_t slash = path.rfind('/');
-
-	if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-		return "application/octet-stream";
-
-	std::string ext = path.substr(dot + 1);
-	for (size_t i = 0; i < ext.size(); i++)
-		ext[i] = std::tolower(ext[i]);
-
-	if (ext == "html" || ext == "htm")
-		return "text/html";
-	if (ext == "css")
-		return "text/css";
-	if (ext == "js")
-		return "application/javascript";
-	if (ext == "txt")
-		return "text/plain";
-	if (ext == "json")
-		return "application/json";
-	if (ext == "png")
-		return "image/png";
-	if (ext == "jpg" || ext == "jpeg")
-		return "image/jpeg";
-	if (ext == "gif")
-		return "image/gif";
-	if (ext == "svg")
-		return "image/svg+xml";
-	if (ext == "ico")
-		return "image/x-icon";
-	if (ext == "pdf")
-		return "application/pdf";
-	return "application/octet-stream";
-}
-
-static bool escapesRoot(const std::string &path)
-{
-	if (path.find("/../") != std::string::npos)
+	if (client.shouldClose())
 		return true;
-	return path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0;
-}
 
-HttpResponse Server::serveFile(std::string path) const
-{
-	size_t query = path.find('?');
-	if (query != std::string::npos)
-		path.erase(query);
+	size_t limit = maxBodySize(client.getListenFd());
 
-	if (path.empty() || path[0] != '/')
-		return errorResponse(400, "Bad Request");
-	if (escapesRoot(path))
-		return errorResponse(403, "Forbidden");
+	client.appendToReadBuffer(buffer, bytesRead);
+	client.parseRequest(limit);
 
-	std::string fullPath = _root + path;
-	struct stat info;
-
-	if (stat(fullPath.c_str(), &info) < 0)
-		return errorResponse(404, "Not Found");
-
-	if (S_ISDIR(info.st_mode)) {
-		if (path[path.size() - 1] != '/') {
-			HttpResponse redirect = errorResponse(301, "Moved Permanently");
-			redirect.setHeader("Location", path + "/");
-			return redirect;
-		}
-		fullPath += _index;
-		if (stat(fullPath.c_str(), &info) < 0)
-			return errorResponse(403, "Forbidden");
+	while (client.requestIsComplete()) {
+		queueResponse(client);
+		if (client.shouldClose())
+			break;
+		client.resetRequest();
+		client.parseRequest(limit);
 	}
-
-	if (!S_ISREG(info.st_mode) || access(fullPath.c_str(), R_OK) < 0)
-		return errorResponse(403, "Forbidden");
-
-	std::string body;
-	if (!readFile(fullPath, body))
-		return errorResponse(500, "Internal Server Error");
-
-	HttpResponse response;
-	response.setHeader("Content-Type", getContentType(fullPath));
-	response.setBody(body);
-	return response;
+	return true;
 }
 
 void Server::queueResponse(Client &client)
 {
 	const HttpRequest &request = client.getRequest();
+	size_t index = pickServer(client);
 	HttpResponse response;
 
-	if (request.getMethod() != "GET")
-		response = errorResponse(405, "Method Not Allowed");
-	else
-		response = serveFile(request.getPath());
+	if (request.getErrorCode()) {
+		// the rest of a broken request is still in the socket, we can't find where the next one starts
+		response = _handlers[index].error(request.getErrorCode());
+		client.markForClose();
+	} else if (request.getBody().size() > _configs[index].maxBodySize) {
+		// the parser used the biggest limit of this port, this server's own limit is smaller
+		response = _handlers[index].error(413);
+	} else {
+		response = _handlers[index].handle(request);
+	}
 
+	std::string connection = request.getHeader("connection");
+	if (connection == "close" || (request.getVersion() == "HTTP/1.0" && connection != "keep-alive"))
+		client.markForClose();
+	if (client.shouldClose())
+		response.setHeader("Connection", "close");
+
+	std::cout << "[" << client.getFd() << "] " << request.getMethod() << " " << request.getPath()
+		<< " -> " << response.getStatusCode() << std::endl;
 	client.appendToWriteBuffer(response.toString());
 }
 
-void Server::closeClient(size_t i, std::map<int, Client>::iterator it)
+void Server::checkTimeouts()
 {
-	std::cout << "Client disconnected! fd=" << it->first << std::endl;
-	close(it->first);
-	_clients.erase(it);
+	time_t now = std::time(NULL);
+
+	for (size_t i = 0; i < _pollfds.size(); ) {
+		std::map<int, Client>::iterator it = _clients.find(_pollfds[i].fd);
+
+		if (it == _clients.end() || now - it->second.getLastActivity() < CLIENT_TIMEOUT) {
+			i++;
+			continue;
+		}
+
+		Client &client = it->second;
+		if (client.hasPartialRequest() && !client.shouldClose()) {
+			// stuck in the middle of a request: tell it why before hanging up
+			HttpResponse response = _handlers[pickServer(client)].error(408);
+			response.setHeader("Connection", "close");
+			client.markForClose();
+			client.appendToWriteBuffer(response.toString());
+			client.touch();
+			_pollfds[i].events |= POLLOUT;
+			std::cout << "[" << client.getFd() << "] timeout -> 408" << std::endl;
+			i++;
+		} else {
+			std::cout << "[" << client.getFd() << "] timeout" << std::endl;
+			closeClient(i);
+		}
+	}
+}
+
+void Server::closeClient(size_t i)
+{
+	close(_pollfds[i].fd);
+	_clients.erase(_pollfds[i].fd);
 	_pollfds.erase(_pollfds.begin() + i);
+}
+
+size_t Server::pickServer(const Client &client) const
+{
+	const std::vector<size_t> &candidates = _listeners.find(client.getListenFd())->second;
+	std::string host = client.getRequest().getHeader("host");
+
+	for (size_t i = 0; i < candidates.size(); i++) {
+		if (_configs[candidates[i]].hasName(host))
+			return candidates[i];
+	}
+	return candidates[0];
+}
+
+size_t Server::maxBodySize(int listenFd) const
+{
+	const std::vector<size_t> &candidates = _listeners.find(listenFd)->second;
+	size_t biggest = 0;
+
+	for (size_t i = 0; i < candidates.size(); i++) {
+		if (_configs[candidates[i]].maxBodySize > biggest)
+			biggest = _configs[candidates[i]].maxBodySize;
+	}
+	return biggest;
 }

@@ -8,3 +8,6 @@ core
 vgcore.*
 *.swp
 .vscode/
+
+www/uploads/*
+!www/uploads/.gitkeep

@@ -4,35 +4,39 @@
 #include <map>
 #include <poll.h>
 #include "Client.hpp"
-#include "Config.hpp"
-#include "HttpResponse.hpp"
+#include "ServerConfig.hpp"
+#include "RequestHandler.hpp"
 
 class Server
 {
 public:
-	Server(const Config &config);
+	Server(const std::vector<ServerConfig> &configs);
 	~Server();
 
 	void run();
 
 private:
-	int _port;
-	int _server_fd;
-	std::string _root;
-	std::string _index;
+	static const int CLIENT_TIMEOUT = 30;
+
+	std::vector<ServerConfig> _configs;
+	std::vector<RequestHandler> _handlers;
+	std::map<int, std::vector<size_t> > _listeners;
 	std::vector<struct pollfd> _pollfds;
 	std::map<int, Client> _clients;
 
-	void setupSocket();
-	void acceptNewClient();
-	void handleServerEvent(short revents);
+	void setupSockets();
+	int openListenSocket(const Listen &listen);
+	void closeAll();
+
+	void acceptNewClient(int listenFd);
 	bool handleClientEvent(size_t i);
-	bool readFromClient(std::map<int, Client>::iterator it);
-	bool writeToClient(std::map<int, Client>::iterator it);
-	void printRequest(const HttpRequest &req) const;
+	bool readFromClient(Client &client);
 	void queueResponse(Client &client);
-	HttpResponse serveFile(std::string path) const;
-	void closeClient(size_t i, std::map<int, Client>::iterator it);
+	void checkTimeouts();
+	void closeClient(size_t i);
+
+	size_t pickServer(const Client &client) const;
+	size_t maxBodySize(int listenFd) const;
 
 	Server(const Server &other);
 	Server &operator=(const Server &other);

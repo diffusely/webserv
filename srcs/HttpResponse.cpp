@@ -29,9 +29,15 @@ std::string HttpResponse::toString() const
 	response << "HTTP/1.1 " << _statusCode << " " << _statusReason << "\r\n";
 	for (std::map<std::string, std::string>::const_iterator it = _headers.begin(); it != _headers.end(); ++it)
 		response << it->first << ": " << it->second << "\r\n";
-	response << "Content-Length: " << _body.size() << "\r\n";
+	if (_statusCode != 204)
+		response << "Content-Length: " << _body.size() << "\r\n";
 	response << "\r\n";
 	response << _body;
 
 	return response.str();
+}
+
+int HttpResponse::getStatusCode() const
+{
+	return _statusCode;
 }
