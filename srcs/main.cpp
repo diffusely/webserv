@@ -13,6 +13,8 @@ int main(int argc, char **argv)
 
 	// a client that disconnects while we send() would otherwise kill the whole server
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, Server::stop);
+	signal(SIGTERM, Server::stop);
 
 	try
 	{

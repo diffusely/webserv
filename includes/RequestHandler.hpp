@@ -4,6 +4,7 @@
 #include "ServerConfig.hpp"
 #include "HttpRequest.hpp"
 #include "HttpResponse.hpp"
+#include "CgiProcess.hpp"
 
 class RequestHandler
 {
@@ -12,6 +13,7 @@ public:
 
 	HttpResponse handle(const HttpRequest &request) const;
 	HttpResponse error(int code) const;
+	bool findCgi(const HttpRequest &request, CgiRequest &cgi) const;
 
 private:
 	ServerConfig _config;

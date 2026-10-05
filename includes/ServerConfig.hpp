@@ -14,6 +14,7 @@ struct Location
 	std::string uploadStore;
 	int redirectCode;
 	std::string redirectUrl;
+	std::map<std::string, std::string> cgi;
 
 	Location();
 

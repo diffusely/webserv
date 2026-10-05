@@ -1,7 +1,7 @@
 #include "Client.hpp"
 
-Client::Client(int fd, int listenFd)
-	: _fd(fd), _listenFd(listenFd), _lastActivity(std::time(NULL)), _closeAfterWrite(false)
+Client::Client(int fd, int listenFd, const std::string &remoteAddr)
+	: _fd(fd), _listenFd(listenFd), _remoteAddr(remoteAddr), _waitingForCgi(false), _lastActivity(std::time(NULL)), _closeAfterWrite(false)
 {
 }
 
@@ -13,6 +13,21 @@ int Client::getFd() const
 int Client::getListenFd() const
 {
 	return _listenFd;
+}
+
+const std::string &Client::getRemoteAddr() const
+{
+	return _remoteAddr;
+}
+
+void Client::setWaitingForCgi(bool waiting)
+{
+	_waitingForCgi = waiting;
+}
+
+bool Client::isWaitingForCgi() const
+{
+	return _waitingForCgi;
 }
 
 void Client::touch()
@@ -33,16 +48,6 @@ bool Client::hasPartialRequest() const
 void Client::appendToReadBuffer(const char *data, size_t len)
 {
 	_readBuffer.append(data, len);
-}
-
-const std::string &Client::getReadBuffer() const
-{
-	return _readBuffer;
-}
-
-void Client::clearReadBuffer()
-{
-	_readBuffer.clear();
 }
 
 void Client::parseRequest(size_t maxBodySize)

@@ -181,6 +181,16 @@ void Config::locationDirective(Location &loc, const std::string &name, const std
 		return;
 	}
 
+	if (name == "cgi") {
+		// cgi .py /usr/bin/python3;
+		if (args.size() != 2)
+			throw std::runtime_error("config: 'cgi' takes an extension and an interpreter");
+		if (args[0].size() < 2 || args[0][0] != '.')
+			throw std::runtime_error("config: cgi extension must look like '.py': '" + args[0] + "'");
+		loc.cgi[args[0]] = args[1];
+		return;
+	}
+
 	if (name == "return") {
 		// return 301 http://example.com/;
 		if (args.size() != 2)

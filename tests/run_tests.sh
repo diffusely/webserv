@@ -1,6 +1,7 @@
 #!/bin/bash
 # Automated checks for webserv. Run from the repo root: ./tests/run_tests.sh
 # SKIP_SLOW=1 ./tests/run_tests.sh  skips the 30-second timeout test.
+# VALGRIND=1 ./tests/run_tests.sh   runs the server under valgrind and checks leaks / fds at the end.
 
 cd "$(dirname "$0")/.." || exit 1
 
@@ -55,10 +56,30 @@ echo '<h1>custom 404</h1>' > "$SITE/404.html"
 echo 'body {}' > "$SITE/style.css"
 echo 'secret' > "$SITE/secret.txt"; chmod 000 "$SITE/secret.txt"
 echo 'a' > "$SITE/files/a.txt"
+echo 'spaced' > "$SITE/files/my file.txt"
 echo 'cat' > "$OTHER/images/cat.png"
 echo '<h1>port two</h1>' > "$OTHER/index.html"
 echo '<h1>vhost b</h1>' > "$TMP/vhost/index.html"
 head -c 5000000 /dev/urandom > "$SITE/big.bin"
+
+PYTHON=$(command -v python3)
+mkdir -p "$SITE/cgi"
+cat > "$SITE/cgi/env.py" <<'PY'
+import os
+print("Content-Type: text/plain")
+print()
+for key in ("REQUEST_METHOD", "QUERY_STRING", "PATH_INFO", "SCRIPT_NAME", "SERVER_PORT", "HTTP_X_TEST"):
+    print("%s=%s" % (key, os.environ.get(key, "")))
+PY
+cat > "$SITE/cgi/md5.py" <<'PY'
+import sys, hashlib
+data = sys.stdin.buffer.read()
+print("Content-Type: text/plain\r\n\r\n%d %s" % (len(data), hashlib.md5(data).hexdigest()), end="")
+PY
+printf 'import sys\nsys.exit(3)\n' > "$SITE/cgi/crash.py"
+printf 'print("not a header")\nprint()\n' > "$SITE/cgi/garbage.py"
+printf 'print("Status: 418 Teapot")\nprint("Content-Type: text/plain")\nprint()\n' > "$SITE/cgi/status.py"
+printf 'while True:\n    pass\n' > "$SITE/cgi/hang.py"
 
 cat > "$TMP/test.conf" <<EOF
 server {
@@ -75,6 +96,7 @@ server {
 	location /old { return 301 http://example.com/new; }
 	location /upload { methods GET POST; upload_store $STORE; }
 	location /up { methods GET POST DELETE; }
+	location /cgi { methods GET POST; cgi .py $PYTHON; }
 }
 
 server {
@@ -96,9 +118,15 @@ server {
 }
 EOF
 
-./webserv "$TMP/test.conf" > "$TMP/server.log" 2>&1 &
+if [ "$VALGRIND" == "1" ]; then
+	valgrind --leak-check=full --show-leak-kinds=definite,indirect --track-fds=yes \
+		--child-silent-after-fork=yes --log-file="$TMP/valgrind.log" \
+		./webserv "$TMP/test.conf" > "$TMP/server.log" 2>&1 &
+else
+	./webserv "$TMP/test.conf" > "$TMP/server.log" 2>&1 &
+fi
 SERVER_PID=$!
-for _ in $(seq 50); do
+for _ in $(seq 100); do
 	curl -s -o /dev/null "http://127.0.0.1:$P1/" && break
 	sleep 0.1
 done
@@ -118,6 +146,11 @@ check "custom 404 page"                "<h1>custom 404</h1>" "$(curl -s $URL/nop
 check "GET /secret.txt (chmod 000)"    403 "$(code $URL/secret.txt)"
 check "GET /../../etc/passwd"          403 "$(code --path-as-is "$URL/../../etc/passwd")"
 check "GET /noindex/ no autoindex"     403 "$(code $URL/noindex/)"
+check "GET /files/my%20file.txt"       spaced "$(curl -s "$URL/files/my%20file.txt")"
+check "autoindex link is encoded"      yes "$(curl -s $URL/files/ | grep -q 'href="my%20file.txt"' && echo yes || echo no)"
+check "%2e%2e is still ../"            403 "$(code --path-as-is "$URL/files/%2e%2e/%2e%2e/etc/passwd")"
+check "%00 in path"                    400 "$(code "$URL/files/a.txt%00.html")"
+check "broken %zz escape"              400 "$(code "$URL/files/%zz")"
 curl -s -o "$TMP/big.out" "$URL/big.bin"
 check "GET 5MB binary intact"          same "$(cmp -s "$TMP/big.out" "$SITE/big.bin" && echo same || echo different)"
 
@@ -142,6 +175,7 @@ check "multipart without file"         400 "$(code -F "note=hi" $URL/upload)"
 check "DELETE file"                    204 "$(code -X DELETE $URL/up/raw.txt)"
 check "DELETE again"                   404 "$(code -X DELETE $URL/up/raw.txt)"
 check "DELETE directory"               403 "$(code -X DELETE $URL/files/sub)"
+check "DELETE my%20file.txt"           204 "$(code -X DELETE "$URL/files/my%20file.txt")"
 head -c 200000 /dev/urandom > "$TMP/big.post"
 check "body over limit -> 413"         413 "$(code --data-binary @"$TMP/big.post" $URL/up/big.post)"
 check "413 file not created"           no "$([ -e "$SITE/up/big.post" ] && echo yes || echo no)"
@@ -183,6 +217,33 @@ check "Host: b.local (same port)"      "<h1>vhost b</h1>" "$(curl -s -H 'Host: b
 check "unknown Host -> first server"   "<h1>home</h1>" "$(curl -s -H 'Host: zzz' $URL/)"
 check "b.local own body limit (10)"    413 "$(code -H 'Host: b.local' --data-binary 'more than ten bytes' $URL/x)"
 
+section "CGI"
+check "GET env: method"               "REQUEST_METHOD=GET" "$(curl -s "$URL/cgi/env.py/a/b?x=1" | grep METHOD)"
+check "GET env: query string"         "QUERY_STRING=x=1" "$(curl -s "$URL/cgi/env.py/a/b?x=1" | grep QUERY)"
+check "GET env: PATH_INFO"            "PATH_INFO=/a/b" "$(curl -s "$URL/cgi/env.py/a/b?x=1" | grep PATH_INFO)"
+check "GET env: SCRIPT_NAME"          "SCRIPT_NAME=/cgi/env.py" "$(curl -s "$URL/cgi/env.py/a/b?x=1" | grep SCRIPT_NAME)"
+check "GET env: SERVER_PORT"          "SERVER_PORT=$P1" "$(curl -s "$URL/cgi/env.py" | grep SERVER_PORT)"
+check "header -> HTTP_X_TEST"         "HTTP_X_TEST=hi" "$(curl -s -H 'X-Test: hi' "$URL/cgi/env.py" | grep HTTP_X_TEST)"
+head -c 90000 /dev/urandom > "$TMP/cgi.bin"
+EXPECTED="90000 $(md5sum "$TMP/cgi.bin" | cut -d' ' -f1)"
+check "POST 90K into stdin intact"    "$EXPECTED" "$(curl -s --data-binary @"$TMP/cgi.bin" $URL/cgi/md5.py)"
+check "chunked POST un-chunked"       "$EXPECTED" "$(curl -s -H 'Transfer-Encoding: chunked' --data-binary @"$TMP/cgi.bin" $URL/cgi/md5.py)"
+check "script crashes -> 502"         502 "$(code $URL/cgi/crash.py)"
+check "garbage output -> 502"         502 "$(code $URL/cgi/garbage.py)"
+check "Status: header from script"    418 "$(code $URL/cgi/status.py)"
+check "missing script -> 404"         404 "$(code $URL/cgi/nope.py)"
+check "DELETE on cgi location -> 405" 405 "$(code -X DELETE $URL/cgi/env.py)"
+check "pipelined CGI keeps order"     "x=1 x=2" "$(printf 'GET /cgi/env.py?x=1 HTTP/1.1\r\nHost: x\r\n\r\nGET /cgi/env.py?x=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | timeout 3 nc 127.0.0.1 $P1 | grep QUERY | cut -d= -f2- | tr -d '\r' | tr '\n' ' ' | sed 's/ $//')"
+PIDS=""
+for i in $(seq 20); do
+	code "$URL/cgi/env.py?n=$i" > "$TMP/g.$i" &
+	PIDS="$PIDS $!"
+done
+wait $PIDS
+check "20 parallel CGI all 200"       20 "$(cat "$TMP"/g.* | grep -o 200 | wc -l | tr -d ' ')"
+sleep 0.3
+check "no zombie processes"           0 "$(ps -o pid= --ppid $SERVER_PID 2>/dev/null | wc -l | tr -d ' ')"
+
 section "robustness"
 for _ in $(seq 20); do
 	exec 3<>/dev/tcp/127.0.0.1/$P1
@@ -204,13 +265,15 @@ done
 wait $PIDS
 OK=$(cat "$TMP"/c.* | grep -o 200 | wc -l | tr -d ' ')
 check "100 parallel requests all 200"  100 "$OK"
-if [ -d /proc/$SERVER_PID/fd ]; then
+if [ -d /proc/$SERVER_PID/fd ] && [ "$VALGRIND" != "1" ]; then
 	sleep 0.5
 	check "no leaked fds (3 listen + 3 std)" 6 "$(ls /proc/$SERVER_PID/fd | wc -l)"
 fi
 
 if [ "$SKIP_SLOW" != "1" ]; then
 	section "timeouts (waits 31s)"
+	curl -s -o /dev/null -w "%{http_code}" --max-time 20 $URL/cgi/hang.py > "$TMP/hang.code" &
+	HANG_PID=$!
 	exec 4<>/dev/tcp/127.0.0.1/$P1
 	printf 'GET / HTTP/1.1\r\nHost: x\r\n' >&4
 	exec 5<>/dev/tcp/127.0.0.1/$P1
@@ -218,6 +281,9 @@ if [ "$SKIP_SLOW" != "1" ]; then
 	check "stuck mid-request -> 408"   "HTTP/1.1 408 Request Timeout" "$(timeout 2 head -n 1 <&4 | tr -d '\r')"
 	check "idle connection closed"     "" "$(timeout 2 cat <&5)"
 	exec 4<&- 5<&-
+	wait $HANG_PID
+	check "endless CGI killed -> 504"  504 "$(cat "$TMP/hang.code")"
+	check "hung script really killed"  0 "$(ps -o pid= --ppid $SERVER_PID 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
 section "config errors"
@@ -235,6 +301,22 @@ bad "bad redirect code"     'server { listen 8080; root .; location /a { return 
 check "two arguments"       1 "$(./webserv a b > /dev/null 2>&1; echo $?)"
 
 check "server still alive at the end" yes "$(server_alive)"
+
+if [ "$VALGRIND" == "1" ]; then
+	section "valgrind"
+	kill -INT "$SERVER_PID"
+	wait "$SERVER_PID"
+	SERVER_PID=""
+	LOG="$TMP/valgrind.log"
+	check "no memory errors"       "0 errors" "$(grep -o 'ERROR SUMMARY: [0-9]* errors' "$LOG" | tail -1 | cut -d' ' -f3-)"
+	check "nothing definitely lost" yes "$(grep -q 'definitely lost: 0 bytes\|All heap blocks were freed' "$LOG" && echo yes || echo no)"
+	check "nothing indirectly lost" yes "$(grep -q 'indirectly lost: 0 bytes\|All heap blocks were freed' "$LOG" && echo yes || echo no)"
+	# valgrind's own log file shows up as an open fd too - it isn't ours
+	check "no fds left open at exit" 0 "$(grep 'Open file descriptor' "$LOG" | grep -v 'valgrind.log' | grep -vc 'descriptor [012]:')"
+	check "all heap memory freed"   yes "$(grep -q 'in use at exit: 0 bytes' "$LOG" && echo yes || echo no)"
+	cp "$LOG" ./valgrind.log
+	echo "  full report: ./valgrind.log"
+fi
 
 # ---------------------------------------------------------------- summary
 

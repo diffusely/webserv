@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>webserv CGI</title>
+</head>
+<body>
+	<h1>CGI demo</h1>
+	<p><a href="/cgi-bin/hello.py?name=42">GET /cgi-bin/hello.py?name=42</a></p>
+	<form action="/cgi-bin/form.py" method="post">
+		<input name="login" placeholder="login">
+		<input name="message" placeholder="message">
+		<button type="submit">POST to form.py</button>
+	</form>
+	<p><a href="/">home</a></p>
+</body>
+</html>

@@ -11,3 +11,5 @@ vgcore.*
 
 www/uploads/*
 !www/uploads/.gitkeep
+valgrind.log
+*.d

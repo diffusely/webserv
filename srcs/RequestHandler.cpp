@@ -30,6 +30,8 @@ static std::string reasonPhrase(int code)
 		case 414: return "URI Too Long";
 		case 431: return "Request Header Fields Too Large";
 		case 501: return "Not Implemented";
+		case 502: return "Bad Gateway";
+		case 504: return "Gateway Timeout";
 		case 505: return "HTTP Version Not Supported";
 		default: return "Internal Server Error";
 	}
@@ -91,13 +93,68 @@ static bool escapesRoot(const std::string &path)
 	return path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0;
 }
 
-// strips "?query" and returns an error code if the path is unusable, 0 if it's fine
+static int hexValue(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	c = std::tolower(c);
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	return -1;
+}
+
+// "/my%20file.txt" -> "/my file.txt"; false on broken escapes and on %00
+static bool urlDecode(std::string &path)
+{
+	std::string result;
+
+	for (size_t i = 0; i < path.size(); i++) {
+		if (path[i] != '%') {
+			result += path[i];
+			continue;
+		}
+		if (i + 2 >= path.size() || hexValue(path[i + 1]) < 0 || hexValue(path[i + 2]) < 0)
+			return false;
+		char c = hexValue(path[i + 1]) * 16 + hexValue(path[i + 2]);
+		if (c == '\0')
+			return false;
+		result += c;
+		i += 2;
+	}
+	path = result;
+	return true;
+}
+
+// for links in autoindex: everything except letters, digits and -._~ becomes %XX
+static std::string urlEncode(const std::string &name)
+{
+	const char *hex = "0123456789ABCDEF";
+	std::string result;
+
+	for (size_t i = 0; i < name.size(); i++) {
+		unsigned char c = name[i];
+
+		if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/')
+			result += c;
+		else {
+			result += '%';
+			result += hex[c >> 4];
+			result += hex[c & 15];
+		}
+	}
+	return result;
+}
+
+// strips "?query", decodes %XX and returns an error code if the path is unusable, 0 if it's fine
 static int cleanPath(std::string &path)
 {
 	size_t query = path.find('?');
 	if (query != std::string::npos)
 		path.erase(query);
 
+	// decode first: "/%2e%2e/" must be caught as "/../" below
+	if (!urlDecode(path))
+		return 400;
 	if (path.empty() || path[0] != '/')
 		return 400;
 	if (escapesRoot(path))
@@ -193,6 +250,51 @@ HttpResponse RequestHandler::handle(const HttpRequest &request) const
 	return serveDelete(loc, path);
 }
 
+// GET/POST to a file whose extension has a "cgi" line in its location -> run it as a script.
+// /cgi-bin/test.py/extra?x=1  ->  script /cgi-bin/test.py, PATH_INFO /extra, QUERY_STRING x=1
+bool RequestHandler::findCgi(const HttpRequest &request, CgiRequest &cgi) const
+{
+	std::string path = request.getPath();
+	const std::string &method = request.getMethod();
+	size_t question = path.find('?');
+	std::string query = question == std::string::npos ? "" : path.substr(question + 1);
+
+	if (cleanPath(path))
+		return false;
+
+	const Location &loc = _config.findLocation(path);
+	if (loc.cgi.empty() || loc.redirectCode || !loc.allows(method) || (method != "GET" && method != "POST"))
+		return false;
+
+	size_t end = 0;
+	while (end != std::string::npos) {
+		end = path.find('/', end + 1);
+		std::string scriptName = path.substr(0, end);
+		size_t dot = scriptName.rfind('.');
+
+		if (dot == std::string::npos || scriptName.find('/', dot) != std::string::npos)
+			continue;
+
+		std::map<std::string, std::string>::const_iterator it = loc.cgi.find(scriptName.substr(dot));
+		if (it == loc.cgi.end())
+			continue;
+
+		std::string fullPath = loc.root + scriptName;
+		struct stat info;
+		if (stat(fullPath.c_str(), &info) < 0 || !S_ISREG(info.st_mode) || access(fullPath.c_str(), R_OK) < 0)
+			return false;
+
+		cgi.interpreter = it->second;
+		cgi.scriptDir = parentDir(fullPath);
+		cgi.scriptFile = fullPath.substr(fullPath.rfind('/') + 1);
+		cgi.scriptName = scriptName;
+		cgi.pathInfo = end == std::string::npos ? "" : path.substr(end);
+		cgi.query = query;
+		return true;
+	}
+	return false;
+}
+
 // custom page from error_page if configured and readable, built-in one otherwise
 HttpResponse RequestHandler::error(int code) const
 {
@@ -285,7 +387,7 @@ HttpResponse RequestHandler::listDirectory(const std::string &fullPath, const st
 	std::string body = "<html><head><title>" + title + "</title></head><body><h1>" + title + "</h1><hr><ul>";
 	for (size_t i = 0; i < names.size(); i++) {
 		std::string name = names[i] == ".." ? "../" : names[i];
-		body += "<li><a href=\"" + htmlEscape(name) + "\">" + htmlEscape(name) + "</a></li>";
+		body += "<li><a href=\"" + urlEncode(name) + "\">" + htmlEscape(name) + "</a></li>";
 	}
 	body += "</ul><hr></body></html>";
 
